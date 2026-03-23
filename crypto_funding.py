@@ -22,6 +22,7 @@ import argparse
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -64,6 +65,12 @@ SIMULATE_PAIRS: dict[tuple[str, str], str] = {
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _log(tag: str, msg: str, error: bool = False) -> None:
+    ts = _utc_now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] [{tag}] {msg}"
+    print(line, file=sys.stderr if error else sys.stdout, flush=True)
 
 
 def _iso_z(dt: datetime | pd.Timestamp | pd.Series) -> str | pd.Series:
@@ -173,17 +180,26 @@ def _fetch_deribit(instrument: str, days: int) -> list[dict]:
     cur = start_ms
     while cur <= end_ms:
         cur_end = min(cur + int(chunk.total_seconds() * 1000) - 1, end_ms)
-        try:
-            r = requests.get(
-                f"{_DERIBIT_BASE}/api/v2/public/get_funding_rate_history",
-                params={"instrument_name": instrument, "start_timestamp": cur, "end_timestamp": cur_end},
-                timeout=20,
-            )
-            r.raise_for_status()
-            result = r.json().get("result")
-            page = result if isinstance(result, list) else (result.get("data", []) if isinstance(result, dict) else [])
-        except requests.HTTPError as e:
-            page = [] if e.response is not None and e.response.status_code == 400 else (_ for _ in ()).throw(e)
+        page: list[dict] = []
+        for attempt in range(3):
+            try:
+                r = requests.get(
+                    f"{_DERIBIT_BASE}/api/v2/public/get_funding_rate_history",
+                    params={"instrument_name": instrument, "start_timestamp": cur, "end_timestamp": cur_end},
+                    timeout=20,
+                )
+                r.raise_for_status()
+                result = r.json().get("result")
+                page = result if isinstance(result, list) else (result.get("data", []) if isinstance(result, dict) else [])
+                break
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 400:
+                    break
+                if attempt < 2:
+                    _log("DERIBIT", f"{instrument}: retry {attempt + 1}/3 after HTTP {e.response.status_code if e.response is not None else '?'}")
+                    time.sleep(2 ** attempt)
+                else:
+                    raise
         if page:
             out.extend(page)
         cur = cur_end + 1
@@ -343,7 +359,7 @@ def _write_df(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def _fetch_all(days: int) -> list[pd.DataFrame]:
-    """Fetch funding rates from all exchanges, return list of DataFrames."""
+    """Fetch funding rates from all exchanges in parallel, return list of DataFrames."""
     frames: list[pd.DataFrame] = []
 
     jobs: list[tuple[str, str, Any]] = []  # (tag, symbol, callable)
@@ -363,23 +379,31 @@ def _fetch_all(days: int) -> list[pd.DataFrame]:
     for sym in BYBIT_SYMBOLS:
         jobs.append(("BYBIT", sym, lambda s=sym: _normalize_bybit(_fetch_bybit(s, days), s, days)))
 
-    for tag, sym, fetch_fn in jobs:
-        print(f"[{tag}] Fetching {sym} ...")
+    def _run_job(tag: str, sym: str, fetch_fn: Any) -> pd.DataFrame | None:
+        _log(tag, f"Fetching {sym} ...")
         try:
             df = fetch_fn()
-            print(f"[{tag}] {sym}: {len(df)} records after filtering to last {days} days.")
-            if not df.empty:
-                frames.append(df)
+            _log(tag, f"{sym}: {len(df)} records after filtering to last {days} days.")
+            return df if not df.empty else None
         except Exception as e:
-            print(f"ERROR [{tag}] {sym}: {e}", file=sys.stderr)
+            _log(tag, f"{sym}: {e}", error=True)
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_run_job, tag, sym, fn): (tag, sym) for tag, sym, fn in jobs}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                frames.append(result)
 
     return frames
 
 
 def cmd_download(args: argparse.Namespace) -> None:
+    t0 = time.monotonic()
     frames = _fetch_all(args.days)
     if not frames:
-        print("No data collected from any exchange.")
+        _log("DOWNLOAD", "No data collected from any exchange.", error=True)
         sys.exit(1)
 
     df_all = pd.concat(frames, ignore_index=True).sort_values(["exchange", "symbol", "timestamp"]).reset_index(drop=True)
@@ -391,7 +415,8 @@ def cmd_download(args: argparse.Namespace) -> None:
     finally:
         conn.close()
 
-    print(f"Saved {len(df_all)} rows to {args.db} (table: {TABLE}).")
+    elapsed = time.monotonic() - t0
+    _log("DOWNLOAD", f"Saved {len(df_all)} rows to {args.db} in {elapsed:.1f}s.")
 
 
 # ---------------------------------------------------------------------------
@@ -474,13 +499,13 @@ def cmd_simulate(args: argparse.Namespace) -> None:
     for (exchange, symbol), label in SIMULATE_PAIRS.items():
         raw = _query_rates(conn, exchange, symbol, start_z, end_z)
         if raw.empty:
-            print(f"[Skip] No data for ({exchange}, {symbol}) in range.")
+            _log("SIMULATE", f"Skip — no data for ({exchange}, {symbol}) in range.")
             continue
         hourly = _to_hourly(exchange, raw)
         mask = (hourly["timestamp"] >= pd.to_datetime(start_z)) & (hourly["timestamp"] < pd.to_datetime(end_z))
         hourly = hourly.loc[mask].drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
         if hourly.empty:
-            print(f"[Skip] No hourly rates for ({exchange}, {symbol}).")
+            _log("SIMULATE", f"Skip — no hourly rates for ({exchange}, {symbol}).")
             continue
         hist = _simulate_compounding(hourly, args.investment)
         histories[label] = hist
@@ -489,14 +514,14 @@ def cmd_simulate(args: argparse.Namespace) -> None:
     conn.close()
 
     if not histories:
-        print("No data available for any selected pair in the range.")
+        _log("SIMULATE", "No data available for any selected pair in the range.", error=True)
         sys.exit(1)
 
-    print(f"\nInvestment per leg: {args.investment:,.2f}")
-    print(f"Period: {start_date} to {end_date} ({args.days} days)\n")
+    _log("SIMULATE", f"Investment per leg: {args.investment:,.2f}")
+    _log("SIMULATE", f"Period: {start_date} to {end_date} ({args.days} days)")
     for label, fv in finals.items():
         ret_pct = (fv / args.investment - 1) * 100
-        print(f"  {label}: {fv:,.2f}  ({ret_pct:+.2f}%)")
+        _log("SIMULATE", f"  {label}: {fv:,.2f}  ({ret_pct:+.2f}%)")
 
     plt.figure(figsize=(11, 6))
     for label, hist in histories.items():
