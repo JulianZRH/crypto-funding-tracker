@@ -655,11 +655,16 @@ def cmd_simulate(args: argparse.Namespace) -> None:
     _log("SIMULATE", f"Period: {start_date} to {end_date} ({args.days} days)")
     for label, fv in finals.items():
         ret_pct = (fv / args.investment - 1) * 100
-        _log("SIMULATE", f"  {label}: {fv:,.2f}  ({ret_pct:+.2f}%)")
+        pa_yield = ((fv / args.investment) ** (365.0 / args.days) - 1) * 100
+        _log("SIMULATE", f"  {label}: {fv:,.2f}  ({ret_pct:+.2f}% / {pa_yield:+.2f}% p.a.)")
 
     plt.figure(figsize=(11, 6))
-    for label, hist in histories.items():
-        plt.plot(hist["timestamp"], hist["portfolio_value"], label=label)
+    for label, fv in finals.items():
+        hist = histories[label]
+        ret_pct = (fv / args.investment - 1) * 100
+        pa_yield = ((fv / args.investment) ** (365.0 / args.days) - 1) * 100
+        plt.plot(hist["timestamp"], hist["portfolio_value"],
+                 label=f"{label}  ({ret_pct:+.2f}% / {pa_yield:+.2f}% p.a.)")
     plt.xlabel("Date (UTC)")
     plt.ylabel("Value (USD)")
     plt.title("Basis Trade: Funding Rate Compounding (hourly)")
