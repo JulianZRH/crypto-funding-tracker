@@ -13,5 +13,8 @@ DAYS = 100
 # Initial investment amount (USD) for the simulation
 INVESTMENT = 100_000
 
+# Which asset to simulate: "BTC" or "ETH"
+ASSET = "BTC"
+
 # SQLite database file path
 DB = "funding_rates.db"

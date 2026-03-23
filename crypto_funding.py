@@ -47,21 +47,34 @@ BINANCE_USDM_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 BINANCE_COINM_SYMBOLS = ["BTCUSD_PERP", "ETHUSD_PERP", "SOLUSD_PERP"]
 DERIBIT_SYMBOLS = ["BTC-PERPETUAL", "ETH-PERPETUAL", "SOL-PERPETUAL"]
 BYBIT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-OKX_SYMBOLS = ["BTC-USDT-SWAP"]
-BITFINEX_SYMBOLS = ["tBTCF0:USTF0"]
-KUCOIN_SYMBOLS = ["XBTUSDTM"]
+OKX_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+BITFINEX_SYMBOLS = ["tBTCF0:USTF0", "tETHF0:USTF0"]
+KUCOIN_SYMBOLS = ["XBTUSDTM", "ETHUSDTM"]
 
-# Pairs to simulate (exchange, symbol) -> chart label
-SIMULATE_PAIRS: dict[tuple[str, str], str] = {
-    ("KRAKEN", "PF_XBTUSD"):          "BTC Perp (Kraken Linear)",
-    ("KRAKEN", "PI_XBTUSD"):          "BTC Perp (Kraken Inverse)",
-    ("BINANCE", "BTCUSDT"):           "BTC Perp (Binance USDT-M)",
-    ("BINANCE_COINM", "BTCUSD_PERP"): "BTC Perp (Binance COIN-M)",
-    ("DERIBIT", "BTC-PERPETUAL"):     "BTC Perp (Deribit)",
-    ("BYBIT", "BTCUSDT"):            "BTC Perp (Bybit USDT-M)",
-    ("OKX", "BTC-USDT-SWAP"):       "BTC Perp (OKX)",
-    ("BITFINEX", "tBTCF0:USTF0"):   "BTC Perp (Bitfinex)",
-    ("KUCOIN", "XBTUSDTM"):        "BTC Perp (KuCoin)",
+# Pairs to simulate per asset — selected via config.ASSET
+SIMULATE_PAIRS_BY_ASSET: dict[str, dict[tuple[str, str], str]] = {
+    "BTC": {
+        ("KRAKEN", "PF_XBTUSD"):          "BTC Perp (Kraken Linear)",
+        ("KRAKEN", "PI_XBTUSD"):          "BTC Perp (Kraken Inverse)",
+        ("BINANCE", "BTCUSDT"):           "BTC Perp (Binance USDT-M)",
+        ("BINANCE_COINM", "BTCUSD_PERP"): "BTC Perp (Binance COIN-M)",
+        ("DERIBIT", "BTC-PERPETUAL"):     "BTC Perp (Deribit)",
+        ("BYBIT", "BTCUSDT"):            "BTC Perp (Bybit USDT-M)",
+        ("OKX", "BTC-USDT-SWAP"):       "BTC Perp (OKX)",
+        ("BITFINEX", "tBTCF0:USTF0"):   "BTC Perp (Bitfinex)",
+        ("KUCOIN", "XBTUSDTM"):        "BTC Perp (KuCoin)",
+    },
+    "ETH": {
+        ("KRAKEN", "PF_ETHUSD"):          "ETH Perp (Kraken Linear)",
+        ("KRAKEN", "PI_ETHUSD"):          "ETH Perp (Kraken Inverse)",
+        ("BINANCE", "ETHUSDT"):           "ETH Perp (Binance USDT-M)",
+        ("BINANCE_COINM", "ETHUSD_PERP"): "ETH Perp (Binance COIN-M)",
+        ("DERIBIT", "ETH-PERPETUAL"):     "ETH Perp (Deribit)",
+        ("BYBIT", "ETHUSDT"):            "ETH Perp (Bybit USDT-M)",
+        ("OKX", "ETH-USDT-SWAP"):       "ETH Perp (OKX)",
+        ("BITFINEX", "tETHF0:USTF0"):   "ETH Perp (Bitfinex)",
+        ("KUCOIN", "ETHUSDTM"):        "ETH Perp (KuCoin)",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -685,7 +698,13 @@ def cmd_simulate(args: argparse.Namespace) -> None:
     histories: dict[str, pd.DataFrame] = {}
     finals: dict[str, float] = {}
 
-    for (exchange, symbol), label in SIMULATE_PAIRS.items():
+    asset = args.asset.upper()
+    simulate_pairs = SIMULATE_PAIRS_BY_ASSET.get(asset)
+    if simulate_pairs is None:
+        _log("SIMULATE", f"Unknown asset '{asset}'. Choose from: {', '.join(SIMULATE_PAIRS_BY_ASSET.keys())}", error=True)
+        sys.exit(1)
+
+    for (exchange, symbol), label in simulate_pairs.items():
         raw = _query_rates(conn, exchange, symbol, start_z, end_z)
         if raw.empty:
             _log("SIMULATE", f"Skip — no data for ({exchange}, {symbol}) in range.")
@@ -722,7 +741,7 @@ def cmd_simulate(args: argparse.Namespace) -> None:
                  label=f"{label}  ({ret_pct:+.2f}% / {pa_yield:+.2f}% p.a.)")
     plt.xlabel("Date (UTC)")
     plt.ylabel("Value (USD)")
-    plt.title(f"Basis Trade: Funding Rate Compounding — {args.days} days ({start_date} to {end_date})")
+    plt.title(f"{asset} Basis Trade: Funding Rate Compounding — {args.days} days ({start_date} to {end_date})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
@@ -745,6 +764,7 @@ def main() -> None:
 
     sim = sub.add_parser("simulate", help="Simulate basis-trade investment and plot results")
     sim.add_argument("--investment", type=float, default=config.INVESTMENT, help=f"Initial investment amount (default: {config.INVESTMENT})")
+    sim.add_argument("--asset", default=config.ASSET, help=f"Asset to simulate: BTC or ETH (default: {config.ASSET})")
 
     args = parser.parse_args()
 
@@ -753,6 +773,8 @@ def main() -> None:
         args.command = config.MODE
         if not hasattr(args, "investment"):
             args.investment = config.INVESTMENT
+        if not hasattr(args, "asset"):
+            args.asset = config.ASSET
 
     if args.command == "download":
         cmd_download(args)
