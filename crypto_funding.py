@@ -515,20 +515,34 @@ def cmd_simulate(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    import config
+
     parser = argparse.ArgumentParser(description="Crypto perpetual funding rate tracker & simulator")
-    parser.add_argument("--db", default=DEFAULT_DB, help=f"SQLite database path (default: {DEFAULT_DB})")
-    parser.add_argument("--days", type=int, default=DEFAULT_LOOKBACK_DAYS, help=f"Lookback period in days (default: {DEFAULT_LOOKBACK_DAYS})")
+    parser.add_argument("--db", default=config.DB, help=f"SQLite database path (default: {config.DB})")
+    parser.add_argument("--days", type=int, default=config.DAYS, help=f"Lookback period in days (default: {config.DAYS})")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("download", help="Download funding rates from all exchanges")
 
     sim = sub.add_parser("simulate", help="Simulate basis-trade investment and plot results")
-    sim.add_argument("--investment", type=float, default=DEFAULT_INVESTMENT, help=f"Initial investment amount (default: {DEFAULT_INVESTMENT})")
+    sim.add_argument("--investment", type=float, default=config.INVESTMENT, help=f"Initial investment amount (default: {config.INVESTMENT})")
 
     args = parser.parse_args()
+
+    # If no subcommand given, use MODE from config.py
+    if args.command is None:
+        args.command = config.MODE
+        if not hasattr(args, "investment"):
+            args.investment = config.INVESTMENT
+
     if args.command == "download":
         cmd_download(args)
     elif args.command == "simulate":
+        cmd_simulate(args)
+    elif args.command == "both":
+        cmd_download(args)
+        if not hasattr(args, "investment"):
+            args.investment = config.INVESTMENT
         cmd_simulate(args)
     else:
         parser.print_help()
