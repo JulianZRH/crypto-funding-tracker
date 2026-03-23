@@ -609,23 +609,16 @@ def _simulate_compounding(rates: pd.DataFrame, initial: float) -> pd.DataFrame:
     return out
 
 
-def cmd_simulate(args: argparse.Namespace) -> None:
-    import matplotlib.pyplot as plt
-
-    start_date = (datetime.now(timezone.utc).date() - timedelta(days=args.days)).isoformat()
-    end_date = datetime.now(timezone.utc).date().isoformat()
-    start_z = pd.to_datetime(start_date, utc=True).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    end_z = (pd.to_datetime(end_date, utc=True).normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-    conn = sqlite3.connect(args.db)
-    histories: dict[str, pd.DataFrame] = {}
-    finals: dict[str, float] = {}
-
-    asset = args.asset.upper()
+def _simulate_asset(asset: str, conn: sqlite3.Connection, args: argparse.Namespace,
+                    start_z: str, end_z: str, start_date: str, end_date: str) -> tuple[dict[str, pd.DataFrame], dict[str, float]]:
+    """Run simulation for a single asset, return (histories, finals)."""
     simulate_pairs = SIMULATE_PAIRS_BY_ASSET.get(asset)
     if simulate_pairs is None:
         _log("SIMULATE", f"Unknown asset '{asset}'. Choose from: {', '.join(SIMULATE_PAIRS_BY_ASSET.keys())}", error=True)
-        sys.exit(1)
+        return {}, {}
+
+    histories: dict[str, pd.DataFrame] = {}
+    finals: dict[str, float] = {}
 
     for (exchange, symbol), label in simulate_pairs.items():
         raw = _query_rates(conn, exchange, symbol, start_z, end_z)
@@ -642,32 +635,63 @@ def cmd_simulate(args: argparse.Namespace) -> None:
         histories[label] = hist
         finals[label] = hist["portfolio_value"].iloc[-1]
 
-    conn.close()
+    if finals:
+        _log("SIMULATE", f"  [{asset}] Investment per leg: {args.investment:,.2f}")
+        _log("SIMULATE", f"  [{asset}] Period: {start_date} to {end_date} ({args.days} days)")
+        for label, fv in finals.items():
+            ret_pct = (fv / args.investment - 1) * 100
+            pa_yield = ((fv / args.investment) ** (365.0 / args.days) - 1) * 100
+            _log("SIMULATE", f"    {label}: {fv:,.2f}  ({ret_pct:+.2f}% / {pa_yield:+.2f}% p.a.)")
 
-    if not histories:
-        _log("SIMULATE", "No data available for any selected pair in the range.", error=True)
-        sys.exit(1)
+    return histories, finals
 
-    _log("SIMULATE", f"Investment per leg: {args.investment:,.2f}")
-    _log("SIMULATE", f"Period: {start_date} to {end_date} ({args.days} days)")
-    for label, fv in finals.items():
-        ret_pct = (fv / args.investment - 1) * 100
-        pa_yield = ((fv / args.investment) ** (365.0 / args.days) - 1) * 100
-        _log("SIMULATE", f"  {label}: {fv:,.2f}  ({ret_pct:+.2f}% / {pa_yield:+.2f}% p.a.)")
 
-    plt.figure(figsize=(11, 6))
+def _plot_asset(asset: str, histories: dict[str, pd.DataFrame], finals: dict[str, float],
+                investment: float, days: int, start_date: str, end_date: str, fig_num: int) -> None:
+    """Create a chart for a single asset."""
+    import matplotlib.pyplot as plt
+
+    plt.figure(fig_num, figsize=(11, 6))
     for label, fv in finals.items():
         hist = histories[label]
-        ret_pct = (fv / args.investment - 1) * 100
-        pa_yield = ((fv / args.investment) ** (365.0 / args.days) - 1) * 100
+        ret_pct = (fv / investment - 1) * 100
+        pa_yield = ((fv / investment) ** (365.0 / days) - 1) * 100
         plt.plot(hist["timestamp"], hist["portfolio_value"],
                  label=f"{label}  ({ret_pct:+.2f}% / {pa_yield:+.2f}% p.a.)")
     plt.xlabel("Date (UTC)")
     plt.ylabel("Value (USD)")
-    plt.title(f"{asset} Basis Trade: Funding Rate Compounding — {args.days} days ({start_date} to {end_date})")
+    plt.title(f"{asset} Basis Trade: Funding Rate Compounding — {days} days ({start_date} to {end_date})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
+
+
+def cmd_simulate(args: argparse.Namespace) -> None:
+    import matplotlib.pyplot as plt
+
+    start_date = (datetime.now(timezone.utc).date() - timedelta(days=args.days)).isoformat()
+    end_date = datetime.now(timezone.utc).date().isoformat()
+    start_z = pd.to_datetime(start_date, utc=True).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    end_z = (pd.to_datetime(end_date, utc=True).normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    asset = args.asset.upper()
+    assets = ["BTC", "ETH"] if asset == "BOTH" else [asset]
+
+    conn = sqlite3.connect(args.db)
+    any_data = False
+
+    for i, a in enumerate(assets):
+        histories, finals = _simulate_asset(a, conn, args, start_z, end_z, start_date, end_date)
+        if finals:
+            any_data = True
+            _plot_asset(a, histories, finals, args.investment, args.days, start_date, end_date, fig_num=i + 1)
+
+    conn.close()
+
+    if not any_data:
+        _log("SIMULATE", "No data available for any selected pair in the range.", error=True)
+        sys.exit(1)
+
     plt.show()
 
 

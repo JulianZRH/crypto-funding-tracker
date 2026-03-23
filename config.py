@@ -13,7 +13,7 @@ DAYS = 100
 # Initial investment amount (USD) for the simulation
 INVESTMENT = 100_000
 
-# Which asset to simulate: "BTC" or "ETH"
+# Which asset to simulate: "BTC", "ETH", or "BOTH"
 ASSET = "BTC"
 
 # SQLite database file path
