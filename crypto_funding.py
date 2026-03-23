@@ -49,6 +49,7 @@ DERIBIT_SYMBOLS = ["BTC-PERPETUAL", "ETH-PERPETUAL", "SOL-PERPETUAL"]
 BYBIT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 OKX_SYMBOLS = ["BTC-USDT-SWAP"]
 BITFINEX_SYMBOLS = ["tBTCF0:USTF0"]
+KUCOIN_SYMBOLS = ["XBTUSDTM"]
 
 # Pairs to simulate (exchange, symbol) -> chart label
 SIMULATE_PAIRS: dict[tuple[str, str], str] = {
@@ -60,6 +61,7 @@ SIMULATE_PAIRS: dict[tuple[str, str], str] = {
     ("BYBIT", "BTCUSDT"):            "BTC Perp (Bybit USDT-M)",
     ("OKX", "BTC-USDT-SWAP"):       "BTC Perp (OKX)",
     ("BITFINEX", "tBTCF0:USTF0"):   "BTC Perp (Bitfinex)",
+    ("KUCOIN", "XBTUSDTM"):        "BTC Perp (KuCoin)",
 }
 
 # ---------------------------------------------------------------------------
@@ -426,6 +428,56 @@ def _normalize_bitfinex(rows: list[dict], symbol: str, days: int) -> pd.DataFram
 
 
 # ---------------------------------------------------------------------------
+# Fetchers — KuCoin
+# ---------------------------------------------------------------------------
+_KUCOIN_BASE = "https://api-futures.kucoin.com"
+
+
+def _fetch_kucoin(symbol: str, days: int) -> list[dict]:
+    start_ms = int(_cutoff(days).timestamp() * 1000)
+    end_ms = int(_utc_now().timestamp() * 1000)
+    out: list[dict] = []
+    cur_from = start_ms
+    while cur_from < end_ms:
+        cur_to = min(cur_from + 31 * 24 * 3600 * 1000, end_ms)
+        r = requests.get(
+            f"{_KUCOIN_BASE}/api/v1/contract/funding-rates",
+            params={"symbol": symbol, "from": cur_from, "to": cur_to},
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", {})
+        lst = data.get("dataList", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        if not lst:
+            cur_from = cur_to + 1
+            time.sleep(0.25)
+            continue
+        for item in lst:
+            ts = item.get("timePoint") or item.get("timepoint") or item.get("fundingTime")
+            fr = item.get("fundingRate")
+            if ts is not None and fr is not None:
+                out.append({"fundingTime": int(ts), "fundingRate": fr})
+        cur_from = cur_to + 1
+        time.sleep(0.25)
+    return out
+
+
+def _normalize_kucoin(rows: list[dict], symbol: str, days: int) -> pd.DataFrame:
+    if not rows:
+        return _empty_df()
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df = df[df["timestamp"] >= _cutoff(days)]
+    df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+    df["relativeFundingRate"] = pd.NA
+    df["timestamp"] = _iso_z(df["timestamp"])
+    df["exchange"] = "KUCOIN"
+    df["symbol"] = symbol
+    return df[OUTPUT_COLS].drop_duplicates(["exchange", "symbol", "timestamp"])
+
+
+# ---------------------------------------------------------------------------
 # SQLite persistence
 # ---------------------------------------------------------------------------
 
@@ -513,6 +565,9 @@ def _fetch_all(days: int) -> list[pd.DataFrame]:
     for sym in BITFINEX_SYMBOLS:
         jobs.append(("BITFINEX", sym, lambda s=sym: _normalize_bitfinex(_fetch_bitfinex(s, days), s, days)))
 
+    for sym in KUCOIN_SYMBOLS:
+        jobs.append(("KUCOIN", sym, lambda s=sym: _normalize_kucoin(_fetch_kucoin(s, days), s, days)))
+
     def _run_job(tag: str, sym: str, fetch_fn: Any) -> pd.DataFrame | None:
         _log(tag, f"Fetching {sym} ...")
         try:
@@ -598,7 +653,7 @@ def _to_hourly(exchange: str, df: pd.DataFrame) -> pd.DataFrame:
         out = df[["timestamp"]].copy()
         out["rate_hourly"] = pd.to_numeric(df["relativeFundingRate"], errors="coerce")
         return out.dropna(subset=["rate_hourly"]).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    if exchange in ("BINANCE", "BINANCE_COINM", "DERIBIT", "BYBIT", "OKX", "BITFINEX"):
+    if exchange in ("BINANCE", "BINANCE_COINM", "DERIBIT", "BYBIT", "OKX", "BITFINEX", "KUCOIN"):
         return _expand_8h_to_hourly(df, "fundingRate")
     # Fallback
     out = df[["timestamp"]].copy()
@@ -667,7 +722,7 @@ def cmd_simulate(args: argparse.Namespace) -> None:
                  label=f"{label}  ({ret_pct:+.2f}% / {pa_yield:+.2f}% p.a.)")
     plt.xlabel("Date (UTC)")
     plt.ylabel("Value (USD)")
-    plt.title("Basis Trade: Funding Rate Compounding (hourly)")
+    plt.title(f"Basis Trade: Funding Rate Compounding — {args.days} days ({start_date} to {end_date})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
