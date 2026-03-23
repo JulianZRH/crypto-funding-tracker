@@ -3,8 +3,8 @@
 Crypto perpetual futures funding rate toolkit.
 
 Subcommands:
-  download   Fetch funding rate history from Kraken, Binance, Deribit, and Bybit
-             into a local SQLite database.
+  download   Fetch funding rate history from Kraken, Binance, Deribit, Bybit,
+             OKX, and Bitfinex into a local SQLite database.
   simulate   Simulate a basis-trade investment (long spot, short perp) by
              compounding collected funding rates, and plot performance.
 
@@ -46,7 +46,9 @@ KRAKEN_SYMBOLS = [
 BINANCE_USDM_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 BINANCE_COINM_SYMBOLS = ["BTCUSD_PERP", "ETHUSD_PERP", "SOLUSD_PERP"]
 DERIBIT_SYMBOLS = ["BTC-PERPETUAL", "ETH-PERPETUAL", "SOL-PERPETUAL"]
-BYBIT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "USDEUSDT"]
+BYBIT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+OKX_SYMBOLS = ["BTC-USDT-SWAP"]
+BITFINEX_SYMBOLS = ["tBTCF0:USTF0"]
 
 # Pairs to simulate (exchange, symbol) -> chart label
 SIMULATE_PAIRS: dict[tuple[str, str], str] = {
@@ -56,7 +58,8 @@ SIMULATE_PAIRS: dict[tuple[str, str], str] = {
     ("BINANCE_COINM", "BTCUSD_PERP"): "BTC Perp (Binance COIN-M)",
     ("DERIBIT", "BTC-PERPETUAL"):     "BTC Perp (Deribit)",
     ("BYBIT", "BTCUSDT"):            "BTC Perp (Bybit USDT-M)",
-    ("BINANCE", "USDEUSDT"):         "USDe Perp (Binance USDT-M)",
+    ("OKX", "BTC-USDT-SWAP"):       "BTC Perp (OKX)",
+    ("BITFINEX", "tBTCF0:USTF0"):   "BTC Perp (Bitfinex)",
 }
 
 # ---------------------------------------------------------------------------
@@ -321,6 +324,108 @@ def _normalize_bybit(rows: list[dict], symbol: str, days: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Fetchers — OKX
+# ---------------------------------------------------------------------------
+_OKX_BASE = "https://www.okx.com"
+
+
+def _fetch_okx(symbol: str, days: int) -> list[dict]:
+    start_ms = int(_cutoff(days).timestamp() * 1000)
+    out: list[dict] = []
+    after = ""  # pagination cursor (oldest fundingTime from previous batch)
+    while True:
+        params: dict[str, Any] = {"instId": symbol, "limit": "100"}
+        if after:
+            params["after"] = after
+        r = requests.get(f"{_OKX_BASE}/api/v5/public/funding-rate-history", params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if not data:
+            break
+        for item in data:
+            ts = int(item["fundingTime"])
+            if ts < start_ms:
+                return out  # reached data older than our window
+            out.append({"fundingTime": ts, "fundingRate": item["fundingRate"]})
+        # paginate backward: use the oldest timestamp from this batch
+        after = data[-1]["fundingTime"]
+        time.sleep(0.25)
+    return out
+
+
+def _normalize_okx(rows: list[dict], symbol: str, days: int) -> pd.DataFrame:
+    if not rows:
+        return _empty_df()
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df = df[df["timestamp"] >= _cutoff(days)]
+    df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+    df["relativeFundingRate"] = pd.NA
+    df["timestamp"] = _iso_z(df["timestamp"])
+    df["exchange"] = "OKX"
+    df["symbol"] = symbol
+    return df[OUTPUT_COLS].drop_duplicates(["exchange", "symbol", "timestamp"])
+
+
+# ---------------------------------------------------------------------------
+# Fetchers — Bitfinex
+# ---------------------------------------------------------------------------
+_BITFINEX_BASE = "https://api-pub.bitfinex.com"
+
+
+def _fetch_bitfinex(symbol: str, days: int) -> list[dict]:
+    start_ms = int(_cutoff(days).timestamp() * 1000)
+    end_ms = int(_utc_now().timestamp() * 1000)
+    out: list[dict] = []
+    cur = start_ms
+    while cur < end_ms:
+        r = requests.get(
+            f"{_BITFINEX_BASE}/v2/status/deriv/{symbol}/hist",
+            params={"start": cur, "end": end_ms, "limit": 5000, "sort": 1},
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data or not isinstance(data, list):
+            break
+        for row in data:
+            if not isinstance(row, list) or len(row) < 12:
+                continue
+            ts = row[0]
+            funding_rate = row[11]
+            if ts is not None and funding_rate is not None:
+                out.append({"fundingTime": int(ts), "fundingRate": funding_rate})
+        # advance past the last timestamp we received
+        last_ts = int(data[-1][0])
+        if last_ts <= cur:
+            break
+        cur = last_ts + 1
+        time.sleep(0.3)
+    return out
+
+
+def _normalize_bitfinex(rows: list[dict], symbol: str, days: int) -> pd.DataFrame:
+    if not rows:
+        return _empty_df()
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df = df[df["timestamp"] >= _cutoff(days)]
+    df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+    # Bitfinex returns per-minute snapshots with instantaneous rates.
+    # Resample to 8-hour windows (mean rate) to align with other exchanges.
+    df = df.set_index("timestamp").sort_index()
+    df_8h = df["fundingRate"].resample("8h").mean().dropna().reset_index()
+    df_8h.columns = ["timestamp", "fundingRate"]
+    df_8h["relativeFundingRate"] = pd.NA
+    df_8h["timestamp"] = _iso_z(df_8h["timestamp"])
+    df_8h["exchange"] = "BITFINEX"
+    df_8h["symbol"] = symbol
+    return df_8h[OUTPUT_COLS].drop_duplicates(["exchange", "symbol", "timestamp"])
+
+
+# ---------------------------------------------------------------------------
 # SQLite persistence
 # ---------------------------------------------------------------------------
 
@@ -401,6 +506,12 @@ def _fetch_all(days: int) -> list[pd.DataFrame]:
 
     for sym in BYBIT_SYMBOLS:
         jobs.append(("BYBIT", sym, lambda s=sym: _normalize_bybit(_fetch_bybit(s, days), s, days)))
+
+    for sym in OKX_SYMBOLS:
+        jobs.append(("OKX", sym, lambda s=sym: _normalize_okx(_fetch_okx(s, days), s, days)))
+
+    for sym in BITFINEX_SYMBOLS:
+        jobs.append(("BITFINEX", sym, lambda s=sym: _normalize_bitfinex(_fetch_bitfinex(s, days), s, days)))
 
     def _run_job(tag: str, sym: str, fetch_fn: Any) -> pd.DataFrame | None:
         _log(tag, f"Fetching {sym} ...")
@@ -487,7 +598,7 @@ def _to_hourly(exchange: str, df: pd.DataFrame) -> pd.DataFrame:
         out = df[["timestamp"]].copy()
         out["rate_hourly"] = pd.to_numeric(df["relativeFundingRate"], errors="coerce")
         return out.dropna(subset=["rate_hourly"]).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    if exchange in ("BINANCE", "BINANCE_COINM", "DERIBIT", "BYBIT"):
+    if exchange in ("BINANCE", "BINANCE_COINM", "DERIBIT", "BYBIT", "OKX", "BITFINEX"):
         return _expand_8h_to_hourly(df, "fundingRate")
     # Fallback
     out = df[["timestamp"]].copy()
