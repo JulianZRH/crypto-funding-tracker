@@ -4,7 +4,7 @@ Crypto perpetual futures funding rate toolkit.
 
 Subcommands:
   download   Fetch funding rate history from Kraken, Binance, Deribit, Bybit,
-             OKX, and Bitfinex into a local SQLite database.
+             OKX, Bitfinex, and KuCoin into a local SQLite database.
   simulate   Simulate a basis-trade investment (long spot, short perp) by
              compounding collected funding rates, and plot performance.
 
@@ -13,7 +13,7 @@ Usage:
   python crypto_funding.py simulate [--days N] [--db PATH] [--investment N]
 
 Dependencies:
-  pip install python-kraken-sdk pandas requests matplotlib
+  pip install python-kraken-sdk pandas requests matplotlib numpy
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 from kraken.futures import Market
@@ -33,15 +34,12 @@ from kraken.futures import Market
 # ---------------------------------------------------------------------------
 # Constants & defaults
 # ---------------------------------------------------------------------------
-DEFAULT_DB = "funding_rates.db"
 TABLE = "funding_rates"
-DEFAULT_LOOKBACK_DAYS = 100
-DEFAULT_INVESTMENT = 100_000
 OUTPUT_COLS = ["exchange", "symbol", "timestamp", "fundingRate", "relativeFundingRate"]
 
 KRAKEN_SYMBOLS = [
-    "PF_XBTUSD", "PF_ETHUSD",                 # linear (multi-collateral)
-    "PI_XBTUSD", "PI_ETHUSD",                 # inverse (single-collateral)
+    "PF_XBTUSD", "PF_ETHUSD",   # linear (multi-collateral)
+    "PI_XBTUSD", "PI_ETHUSD",   # inverse (single-collateral)
 ]
 BINANCE_USDM_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 BINANCE_COINM_SYMBOLS = ["BTCUSD_PERP", "ETHUSD_PERP"]
@@ -51,7 +49,6 @@ OKX_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
 BITFINEX_SYMBOLS = ["tBTCF0:USTF0", "tETHF0:USTF0"]
 KUCOIN_SYMBOLS = ["XBTUSDTM", "ETHUSDTM"]
 
-# Pairs to simulate per asset — selected via config.ASSET
 SIMULATE_PAIRS_BY_ASSET: dict[str, dict[tuple[str, str], str]] = {
     "BTC": {
         ("KRAKEN", "PF_XBTUSD"):          "BTC Perp (Kraken Linear)",
@@ -87,12 +84,10 @@ def _utc_now() -> datetime:
 
 def _log(tag: str, msg: str, error: bool = False) -> None:
     ts = _utc_now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] [{tag}] {msg}"
-    print(line, file=sys.stderr if error else sys.stdout, flush=True)
+    print(f"[{ts}] [{tag}] {msg}", file=sys.stderr if error else sys.stdout, flush=True)
 
 
 def _iso_z(dt: datetime | pd.Timestamp | pd.Series) -> str | pd.Series:
-    """Format UTC datetime(s) as ISO-8601 with trailing Z."""
     if isinstance(dt, pd.Series):
         return dt.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     if isinstance(dt, (pd.Timestamp, datetime)):
@@ -108,6 +103,26 @@ def _cutoff(days: int) -> datetime:
 
 def _empty_df() -> pd.DataFrame:
     return pd.DataFrame(columns=OUTPUT_COLS)
+
+
+def _normalize_generic(rows: list[dict], symbol: str, exchange: str, days: int,
+                        ts_field: str = "fundingTime", ts_unit: str = "ms",
+                        rate_field: str = "fundingRate") -> pd.DataFrame:
+    """Shared normalizer for Binance, Bybit, OKX, KuCoin, and Deribit data."""
+    if not rows:
+        return _empty_df()
+    df = pd.DataFrame([r for r in rows if isinstance(r, dict)])
+    if ts_field not in df.columns:
+        return _empty_df()
+    df["timestamp"] = pd.to_datetime(pd.to_numeric(df[ts_field], errors="coerce"), unit=ts_unit, utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df = df[df["timestamp"] >= _cutoff(days)]
+    df["fundingRate"] = pd.to_numeric(df[rate_field], errors="coerce")
+    df["relativeFundingRate"] = pd.NA
+    df["timestamp"] = _iso_z(df["timestamp"])
+    df["exchange"] = exchange
+    df["symbol"] = symbol
+    return df[OUTPUT_COLS].drop_duplicates(["exchange", "symbol", "timestamp"])
 
 
 # ---------------------------------------------------------------------------
@@ -168,21 +183,6 @@ def _fetch_binance(symbol: str, exchange: str, days: int) -> list[dict]:
     return out
 
 
-def _normalize_binance(rows: list[dict], symbol: str, exchange: str, days: int) -> pd.DataFrame:
-    if not rows:
-        return _empty_df()
-    df = pd.DataFrame(rows)
-    df["timestamp"] = pd.to_datetime(df["fundingTime"], unit="ms", utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp"])
-    df = df[df["timestamp"] >= _cutoff(days)]
-    df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
-    df["relativeFundingRate"] = pd.NA
-    df["timestamp"] = _iso_z(df["timestamp"])
-    df["exchange"] = exchange
-    df["symbol"] = symbol
-    return df[OUTPUT_COLS].drop_duplicates(["exchange", "symbol", "timestamp"])
-
-
 # ---------------------------------------------------------------------------
 # Fetchers — Deribit
 # ---------------------------------------------------------------------------
@@ -234,7 +234,7 @@ def _fetch_deribit(instrument: str, days: int) -> list[dict]:
                     time.sleep(wait)
                 else:
                     _log("DERIBIT", f"{instrument}: all {max_retries} retries failed (HTTP {status})", error=True)
-            except requests.ConnectionError as e:
+            except requests.ConnectionError:
                 if attempt < max_retries - 1:
                     wait = min(2 ** (attempt + 1), 16)
                     _log("DERIBIT", f"{instrument}: connection error, retry {attempt + 1}/{max_retries} (wait {wait}s)")
@@ -254,18 +254,10 @@ def _normalize_deribit(rows: list[dict], instrument: str, days: int) -> pd.DataF
     df = pd.DataFrame([r for r in rows if isinstance(r, dict)])
     if "timestamp" not in df.columns:
         return _empty_df()
-    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"], errors="coerce"), unit="ms", utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp"])
-    df = df[df["timestamp"] >= _cutoff(days)]
     rate_col = "interest_8h" if "interest_8h" in df.columns else ("funding_rate" if "funding_rate" in df.columns else None)
     if rate_col is None:
         return _empty_df()
-    df["fundingRate"] = pd.to_numeric(df[rate_col], errors="coerce")
-    df["relativeFundingRate"] = pd.NA
-    df["timestamp"] = _iso_z(df["timestamp"])
-    df["exchange"] = "DERIBIT"
-    df["symbol"] = instrument
-    return df[OUTPUT_COLS].drop_duplicates(["exchange", "symbol", "timestamp"])
+    return _normalize_generic(rows, instrument, "DERIBIT", days, ts_field="timestamp", rate_field=rate_col)
 
 
 # ---------------------------------------------------------------------------
@@ -323,21 +315,6 @@ def _fetch_bybit(symbol: str, days: int) -> list[dict]:
     return out
 
 
-def _normalize_bybit(rows: list[dict], symbol: str, days: int) -> pd.DataFrame:
-    if not rows:
-        return _empty_df()
-    df = pd.DataFrame(rows)
-    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp"])
-    df = df[df["timestamp"] >= _cutoff(days)]
-    df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
-    df["relativeFundingRate"] = pd.NA
-    df["timestamp"] = _iso_z(df["timestamp"])
-    df["exchange"] = "BYBIT"
-    df["symbol"] = symbol
-    return df[OUTPUT_COLS].drop_duplicates(["exchange", "symbol", "timestamp"])
-
-
 # ---------------------------------------------------------------------------
 # Fetchers — OKX
 # ---------------------------------------------------------------------------
@@ -347,7 +324,7 @@ _OKX_BASE = "https://www.okx.com"
 def _fetch_okx(symbol: str, days: int) -> list[dict]:
     start_ms = int(_cutoff(days).timestamp() * 1000)
     out: list[dict] = []
-    after = ""  # pagination cursor (oldest fundingTime from previous batch)
+    after = ""
     while True:
         params: dict[str, Any] = {"instId": symbol, "limit": "100"}
         if after:
@@ -360,27 +337,11 @@ def _fetch_okx(symbol: str, days: int) -> list[dict]:
         for item in data:
             ts = int(item["fundingTime"])
             if ts < start_ms:
-                return out  # reached data older than our window
+                return out
             out.append({"fundingTime": ts, "fundingRate": item["fundingRate"]})
-        # paginate backward: use the oldest timestamp from this batch
         after = data[-1]["fundingTime"]
         time.sleep(0.25)
     return out
-
-
-def _normalize_okx(rows: list[dict], symbol: str, days: int) -> pd.DataFrame:
-    if not rows:
-        return _empty_df()
-    df = pd.DataFrame(rows)
-    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp"])
-    df = df[df["timestamp"] >= _cutoff(days)]
-    df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
-    df["relativeFundingRate"] = pd.NA
-    df["timestamp"] = _iso_z(df["timestamp"])
-    df["exchange"] = "OKX"
-    df["symbol"] = symbol
-    return df[OUTPUT_COLS].drop_duplicates(["exchange", "symbol", "timestamp"])
 
 
 # ---------------------------------------------------------------------------
@@ -407,11 +368,9 @@ def _fetch_bitfinex(symbol: str, days: int) -> list[dict]:
         for row in data:
             if not isinstance(row, list) or len(row) < 12:
                 continue
-            ts = row[0]
-            funding_rate = row[11]
+            ts, funding_rate = row[0], row[11]
             if ts is not None and funding_rate is not None:
                 out.append({"fundingTime": int(ts), "fundingRate": funding_rate})
-        # advance past the last timestamp we received
         last_ts = int(data[-1][0])
         if last_ts <= cur:
             break
@@ -421,6 +380,7 @@ def _fetch_bitfinex(symbol: str, days: int) -> list[dict]:
 
 
 def _normalize_bitfinex(rows: list[dict], symbol: str, days: int) -> pd.DataFrame:
+    """Bitfinex returns per-minute snapshots; resample to 8h windows."""
     if not rows:
         return _empty_df()
     df = pd.DataFrame(rows)
@@ -428,8 +388,6 @@ def _normalize_bitfinex(rows: list[dict], symbol: str, days: int) -> pd.DataFram
     df = df.dropna(subset=["timestamp"])
     df = df[df["timestamp"] >= _cutoff(days)]
     df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
-    # Bitfinex returns per-minute snapshots with instantaneous rates.
-    # Resample to 8-hour windows (mean rate) to align with other exchanges.
     df = df.set_index("timestamp").sort_index()
     df_8h = df["fundingRate"].resample("8h").mean().dropna().reset_index()
     df_8h.columns = ["timestamp", "fundingRate"]
@@ -475,36 +433,17 @@ def _fetch_kucoin(symbol: str, days: int) -> list[dict]:
     return out
 
 
-def _normalize_kucoin(rows: list[dict], symbol: str, days: int) -> pd.DataFrame:
-    if not rows:
-        return _empty_df()
-    df = pd.DataFrame(rows)
-    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp"])
-    df = df[df["timestamp"] >= _cutoff(days)]
-    df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
-    df["relativeFundingRate"] = pd.NA
-    df["timestamp"] = _iso_z(df["timestamp"])
-    df["exchange"] = "KUCOIN"
-    df["symbol"] = symbol
-    return df[OUTPUT_COLS].drop_duplicates(["exchange", "symbol", "timestamp"])
-
-
 # ---------------------------------------------------------------------------
 # SQLite persistence
 # ---------------------------------------------------------------------------
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create or migrate the funding_rates table."""
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (TABLE,))
     if cur.fetchone() is None:
         conn.execute(f"""
             CREATE TABLE {TABLE} (
-                exchange TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                fundingRate REAL,
-                relativeFundingRate REAL,
+                exchange TEXT NOT NULL, symbol TEXT NOT NULL, timestamp TEXT NOT NULL,
+                fundingRate REAL, relativeFundingRate REAL,
                 PRIMARY KEY (exchange, symbol, timestamp)
             )
         """)
@@ -534,7 +473,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 def _write_df(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
     if df.empty:
         return
-    # sqlite3 cannot bind pandas NA/NaT — convert to None
     clean = df.astype(object).where(pd.notna(df), None)
     rows = list(clean.itertuples(index=False, name=None))
     conn.executemany(f"""
@@ -552,34 +490,24 @@ def _write_df(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def _fetch_all(days: int) -> list[pd.DataFrame]:
-    """Fetch funding rates from all exchanges in parallel, return list of DataFrames."""
-    frames: list[pd.DataFrame] = []
-
-    jobs: list[tuple[str, str, Any]] = []  # (tag, symbol, callable)
+    jobs: list[tuple[str, str, Any]] = []
 
     for sym in KRAKEN_SYMBOLS:
         jobs.append(("KRAKEN", sym, lambda s=sym: _normalize_kraken(_fetch_kraken(s), s, days)))
-
     for sym in BINANCE_USDM_SYMBOLS:
-        jobs.append(("BINANCE USDM", sym, lambda s=sym: _normalize_binance(_fetch_binance(s, "BINANCE", days), s, "BINANCE", days)))
-
+        jobs.append(("BINANCE USDM", sym, lambda s=sym: _normalize_generic(_fetch_binance(s, "BINANCE", days), s, "BINANCE", days)))
     for sym in BINANCE_COINM_SYMBOLS:
-        jobs.append(("BINANCE COINM", sym, lambda s=sym: _normalize_binance(_fetch_binance(s, "BINANCE_COINM", days), s, "BINANCE_COINM", days)))
-
+        jobs.append(("BINANCE COINM", sym, lambda s=sym: _normalize_generic(_fetch_binance(s, "BINANCE_COINM", days), s, "BINANCE_COINM", days)))
     for sym in DERIBIT_SYMBOLS:
         jobs.append(("DERIBIT", sym, lambda s=sym: _normalize_deribit(_fetch_deribit(s, days), s, days)))
-
     for sym in BYBIT_SYMBOLS:
-        jobs.append(("BYBIT", sym, lambda s=sym: _normalize_bybit(_fetch_bybit(s, days), s, days)))
-
+        jobs.append(("BYBIT", sym, lambda s=sym: _normalize_generic(_fetch_bybit(s, days), s, "BYBIT", days)))
     for sym in OKX_SYMBOLS:
-        jobs.append(("OKX", sym, lambda s=sym: _normalize_okx(_fetch_okx(s, days), s, days)))
-
+        jobs.append(("OKX", sym, lambda s=sym: _normalize_generic(_fetch_okx(s, days), s, "OKX", days)))
     for sym in BITFINEX_SYMBOLS:
         jobs.append(("BITFINEX", sym, lambda s=sym: _normalize_bitfinex(_fetch_bitfinex(s, days), s, days)))
-
     for sym in KUCOIN_SYMBOLS:
-        jobs.append(("KUCOIN", sym, lambda s=sym: _normalize_kucoin(_fetch_kucoin(s, days), s, days)))
+        jobs.append(("KUCOIN", sym, lambda s=sym: _normalize_generic(_fetch_kucoin(s, days), s, "KUCOIN", days)))
 
     def _run_job(tag: str, sym: str, fetch_fn: Any) -> pd.DataFrame | None:
         _log(tag, f"Fetching {sym} ...")
@@ -591,6 +519,7 @@ def _fetch_all(days: int) -> list[pd.DataFrame]:
             _log(tag, f"{sym}: {e}", error=True)
             return None
 
+    frames: list[pd.DataFrame] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(_run_job, tag, sym, fn): (tag, sym) for tag, sym, fn in jobs}
         for fut in as_completed(futures):
@@ -609,7 +538,6 @@ def cmd_download(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     df_all = pd.concat(frames, ignore_index=True).sort_values(["exchange", "symbol", "timestamp"]).reset_index(drop=True)
-
     conn = sqlite3.connect(args.db)
     try:
         _ensure_schema(conn)
@@ -617,8 +545,7 @@ def cmd_download(args: argparse.Namespace) -> None:
     finally:
         conn.close()
 
-    elapsed = time.monotonic() - t0
-    _log("DOWNLOAD", f"Saved {len(df_all)} rows to {args.db} in {elapsed:.1f}s.")
+    _log("DOWNLOAD", f"Saved {len(df_all)} rows to {args.db} in {time.monotonic() - t0:.1f}s.")
 
 
 # ---------------------------------------------------------------------------
@@ -640,21 +567,24 @@ def _query_rates(conn: sqlite3.Connection, exchange: str, symbol: str, start_z: 
 
 
 def _expand_8h_to_hourly(df_8h: pd.DataFrame, rate_col: str) -> pd.DataFrame:
-    """Convert 8-hour funding rates to hourly via r_hour = (1 + r_8h)^(1/8) - 1, expanded to 8 rows each."""
+    """Convert 8-hour funding rates to hourly via r_hour = (1 + r_8h)^(1/8) - 1, vectorized."""
     df = df_8h.dropna(subset=[rate_col]).copy()
     if df.empty:
         return pd.DataFrame(columns=["timestamp", "rate_hourly"])
     one_plus = 1.0 + df[rate_col]
-    df = df[one_plus > 0]
+    df = df[one_plus > 0].reset_index(drop=True)
     if df.empty:
         return pd.DataFrame(columns=["timestamp", "rate_hourly"])
-    df["r_hour"] = one_plus.pow(1.0 / 8.0) - 1.0
+    r_hour = one_plus[df.index].pow(1.0 / 8.0) - 1.0
 
-    expanded = []
-    for _, row in df.iterrows():
-        hours = [row["timestamp"] - pd.Timedelta(hours=h) for h in range(7, -1, -1)]
-        expanded.append(pd.DataFrame({"timestamp": hours, "rate_hourly": [row["r_hour"]] * 8}))
-    out = pd.concat(expanded, ignore_index=True)
+    # Vectorized expansion: repeat each row 8 times with hour offsets
+    ts = df["timestamp"].values
+    rates = r_hour.values
+    offsets = np.arange(7, -1, -1)  # 7,6,5,...,0
+    expanded_ts = np.repeat(ts, 8) - np.tile(offsets, len(ts)) * np.timedelta64(1, "h")
+    expanded_rates = np.repeat(rates, 8)
+
+    out = pd.DataFrame({"timestamp": expanded_ts, "rate_hourly": expanded_rates})
     return out.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
 
@@ -666,23 +596,15 @@ def _to_hourly(exchange: str, df: pd.DataFrame) -> pd.DataFrame:
         out = df[["timestamp"]].copy()
         out["rate_hourly"] = pd.to_numeric(df["relativeFundingRate"], errors="coerce")
         return out.dropna(subset=["rate_hourly"]).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    if exchange in ("BINANCE", "BINANCE_COINM", "DERIBIT", "BYBIT", "OKX", "BITFINEX", "KUCOIN"):
-        return _expand_8h_to_hourly(df, "fundingRate")
-    # Fallback
-    out = df[["timestamp"]].copy()
-    rate = pd.to_numeric(df.get("relativeFundingRate"), errors="coerce")
-    if rate is None or rate.isna().all():
-        rate = pd.to_numeric(df.get("fundingRate"), errors="coerce")
-    out["rate_hourly"] = rate
-    return out.dropna(subset=["rate_hourly"]).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    # All other exchanges use 8h funding rates
+    return _expand_8h_to_hourly(df, "fundingRate")
 
 
 def _simulate_compounding(rates: pd.DataFrame, initial: float) -> pd.DataFrame:
-    values = [initial]
-    for r in rates["rate_hourly"]:
-        values.append(values[-1] * (1 + r))
+    """Compound hourly rates using vectorized numpy cumprod."""
+    values = initial * np.cumprod(1.0 + rates["rate_hourly"].values)
     out = rates.copy()
-    out["portfolio_value"] = values[1:]
+    out["portfolio_value"] = values
     return out
 
 
@@ -768,7 +690,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # If no subcommand given, use MODE from config.py
     if args.command is None:
         args.command = config.MODE
         if not hasattr(args, "investment"):
