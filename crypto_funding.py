@@ -170,6 +170,18 @@ def _normalize_binance(rows: list[dict], symbol: str, exchange: str, days: int) 
 # ---------------------------------------------------------------------------
 _DERIBIT_BASE = "https://www.deribit.com"
 _DERIBIT_CHUNK_DAYS = 31
+_DERIBIT_SESSION: requests.Session | None = None
+
+
+def _get_deribit_session() -> requests.Session:
+    global _DERIBIT_SESSION
+    if _DERIBIT_SESSION is None:
+        _DERIBIT_SESSION = requests.Session()
+        _DERIBIT_SESSION.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        })
+    return _DERIBIT_SESSION
 
 
 def _fetch_deribit(instrument: str, days: int) -> list[dict]:
@@ -178,32 +190,43 @@ def _fetch_deribit(instrument: str, days: int) -> list[dict]:
     chunk = timedelta(days=_DERIBIT_CHUNK_DAYS)
     out: list[dict] = []
     cur = start_ms
+    session = _get_deribit_session()
+    max_retries = 5
     while cur <= end_ms:
         cur_end = min(cur + int(chunk.total_seconds() * 1000) - 1, end_ms)
         page: list[dict] = []
-        for attempt in range(3):
+        for attempt in range(max_retries):
             try:
-                r = requests.get(
+                r = session.get(
                     f"{_DERIBIT_BASE}/api/v2/public/get_funding_rate_history",
                     params={"instrument_name": instrument, "start_timestamp": cur, "end_timestamp": cur_end},
-                    timeout=20,
+                    timeout=30,
                 )
                 r.raise_for_status()
                 result = r.json().get("result")
                 page = result if isinstance(result, list) else (result.get("data", []) if isinstance(result, dict) else [])
                 break
             except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 400:
+                status = e.response.status_code if e.response is not None else 0
+                if status == 400:
                     break
-                if attempt < 2:
-                    _log("DERIBIT", f"{instrument}: retry {attempt + 1}/3 after HTTP {e.response.status_code if e.response is not None else '?'}")
-                    time.sleep(2 ** attempt)
+                if attempt < max_retries - 1:
+                    wait = min(2 ** (attempt + 1), 16)
+                    _log("DERIBIT", f"{instrument}: retry {attempt + 1}/{max_retries} after HTTP {status} (wait {wait}s)")
+                    time.sleep(wait)
                 else:
-                    raise
+                    _log("DERIBIT", f"{instrument}: all {max_retries} retries failed (HTTP {status})", error=True)
+            except requests.ConnectionError as e:
+                if attempt < max_retries - 1:
+                    wait = min(2 ** (attempt + 1), 16)
+                    _log("DERIBIT", f"{instrument}: connection error, retry {attempt + 1}/{max_retries} (wait {wait}s)")
+                    time.sleep(wait)
+                else:
+                    _log("DERIBIT", f"{instrument}: all {max_retries} retries failed (connection error)", error=True)
         if page:
             out.extend(page)
         cur = cur_end + 1
-        time.sleep(0.15)
+        time.sleep(0.3)
     return out
 
 
