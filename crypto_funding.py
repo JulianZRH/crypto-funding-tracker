@@ -585,6 +585,7 @@ def _expand_8h_to_hourly(df_8h: pd.DataFrame, rate_col: str) -> pd.DataFrame:
     expanded_rates = np.repeat(rates, 8)
 
     out = pd.DataFrame({"timestamp": expanded_ts, "rate_hourly": expanded_rates})
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
     return out.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
 
