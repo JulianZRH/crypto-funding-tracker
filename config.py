@@ -8,13 +8,13 @@
 MODE = "both"
 
 # Lookback period in days
-DAYS = 100
+DAYS = 30
 
 # Initial investment amount (USD) for the simulation
 INVESTMENT = 100_000
 
 # Which asset to simulate: "BTC", "ETH", or "BOTH"
-ASSET = "BTC"
+ASSET = "BOTH"
 
 # SQLite database file path
 DB = "funding_rates.db"
