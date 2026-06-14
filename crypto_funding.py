@@ -105,7 +105,7 @@ def _empty_df() -> pd.DataFrame:
     return pd.DataFrame(columns=OUTPUT_COLS)
 
 
-def _normalize_generic(rows: list[dict], symbol: str, exchange: str, days: int,
+def _normalize_generic(rows: list[dict], symbol: str, exchange: str, start_dt: datetime,
                         ts_field: str = "fundingTime", ts_unit: str = "ms",
                         rate_field: str = "fundingRate") -> pd.DataFrame:
     """Shared normalizer for Binance, Bybit, OKX, KuCoin, and Deribit data."""
@@ -116,7 +116,7 @@ def _normalize_generic(rows: list[dict], symbol: str, exchange: str, days: int,
         return _empty_df()
     df["timestamp"] = pd.to_datetime(pd.to_numeric(df[ts_field], errors="coerce"), unit=ts_unit, utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
-    df = df[df["timestamp"] >= _cutoff(days)]
+    df = df[df["timestamp"] >= start_dt]
     df["fundingRate"] = pd.to_numeric(df[rate_field], errors="coerce")
     df["relativeFundingRate"] = pd.NA
     df["timestamp"] = _iso_z(df["timestamp"])
@@ -137,7 +137,7 @@ def _fetch_kraken(symbol: str) -> list[dict]:
     return data["rates"]
 
 
-def _normalize_kraken(rates: list[dict], symbol: str, days: int) -> pd.DataFrame:
+def _normalize_kraken(rates: list[dict], symbol: str, start_dt: datetime) -> pd.DataFrame:
     if not rates:
         return _empty_df()
     df = pd.DataFrame(rates)
@@ -145,7 +145,7 @@ def _normalize_kraken(rates: list[dict], symbol: str, days: int) -> pd.DataFrame
     for col in ("fundingRate", "relativeFundingRate"):
         df[col] = pd.to_numeric(df.get(col), errors="coerce") if col in df.columns else pd.NA
     df = df.dropna(subset=["timestamp"])
-    df = df[df["timestamp"] >= _cutoff(days)]
+    df = df[df["timestamp"] >= start_dt]
     df["timestamp"] = _iso_z(df["timestamp"])
     df["exchange"] = "KRAKEN"
     df["symbol"] = symbol
@@ -162,9 +162,9 @@ _BINANCE_URLS = {
 }
 
 
-def _fetch_binance(symbol: str, exchange: str, days: int) -> list[dict]:
+def _fetch_binance(symbol: str, exchange: str, start_dt: datetime) -> list[dict]:
     url = _BINANCE_URLS[exchange]
-    start = int(_cutoff(days).timestamp() * 1000)
+    start = int(start_dt.timestamp() * 1000)
     end = int(_utc_now().timestamp() * 1000)
     out: list[dict] = []
     cur = start
@@ -202,8 +202,8 @@ def _get_deribit_session() -> requests.Session:
     return _DERIBIT_SESSION
 
 
-def _fetch_deribit(instrument: str, days: int) -> list[dict]:
-    start_ms = int(_cutoff(days).timestamp() * 1000)
+def _fetch_deribit(instrument: str, start_dt: datetime) -> list[dict]:
+    start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(_utc_now().timestamp() * 1000)
     chunk = timedelta(days=_DERIBIT_CHUNK_DAYS)
     out: list[dict] = []
@@ -248,7 +248,7 @@ def _fetch_deribit(instrument: str, days: int) -> list[dict]:
     return out
 
 
-def _normalize_deribit(rows: list[dict], instrument: str, days: int) -> pd.DataFrame:
+def _normalize_deribit(rows: list[dict], instrument: str, start_dt: datetime) -> pd.DataFrame:
     if not rows:
         return _empty_df()
     df = pd.DataFrame([r for r in rows if isinstance(r, dict)])
@@ -257,7 +257,7 @@ def _normalize_deribit(rows: list[dict], instrument: str, days: int) -> pd.DataF
     rate_col = "interest_8h" if "interest_8h" in df.columns else ("funding_rate" if "funding_rate" in df.columns else None)
     if rate_col is None:
         return _empty_df()
-    return _normalize_generic(rows, instrument, "DERIBIT", days, ts_field="timestamp", rate_field=rate_col)
+    return _normalize_generic(rows, instrument, "DERIBIT", start_dt, ts_field="timestamp", rate_field=rate_col)
 
 
 # ---------------------------------------------------------------------------
@@ -266,8 +266,8 @@ def _normalize_deribit(rows: list[dict], instrument: str, days: int) -> pd.DataF
 _BYBIT_BASE = "https://api.bybit.com"
 
 
-def _fetch_bybit(symbol: str, days: int) -> list[dict]:
-    start_ms = int(_cutoff(days).timestamp() * 1000)
+def _fetch_bybit(symbol: str, start_dt: datetime) -> list[dict]:
+    start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(_utc_now().timestamp() * 1000)
     out: list[dict] = []
     while True:
@@ -321,8 +321,8 @@ def _fetch_bybit(symbol: str, days: int) -> list[dict]:
 _OKX_BASE = "https://www.okx.com"
 
 
-def _fetch_okx(symbol: str, days: int) -> list[dict]:
-    start_ms = int(_cutoff(days).timestamp() * 1000)
+def _fetch_okx(symbol: str, start_dt: datetime) -> list[dict]:
+    start_ms = int(start_dt.timestamp() * 1000)
     out: list[dict] = []
     after = ""
     while True:
@@ -350,8 +350,8 @@ def _fetch_okx(symbol: str, days: int) -> list[dict]:
 _BITFINEX_BASE = "https://api-pub.bitfinex.com"
 
 
-def _fetch_bitfinex(symbol: str, days: int) -> list[dict]:
-    start_ms = int(_cutoff(days).timestamp() * 1000)
+def _fetch_bitfinex(symbol: str, start_dt: datetime) -> list[dict]:
+    start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(_utc_now().timestamp() * 1000)
     out: list[dict] = []
     cur = start_ms
@@ -379,14 +379,14 @@ def _fetch_bitfinex(symbol: str, days: int) -> list[dict]:
     return out
 
 
-def _normalize_bitfinex(rows: list[dict], symbol: str, days: int) -> pd.DataFrame:
+def _normalize_bitfinex(rows: list[dict], symbol: str, start_dt: datetime) -> pd.DataFrame:
     """Bitfinex returns per-minute snapshots; resample to 8h windows."""
     if not rows:
         return _empty_df()
     df = pd.DataFrame(rows)
     df["timestamp"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
-    df = df[df["timestamp"] >= _cutoff(days)]
+    df = df[df["timestamp"] >= start_dt]
     df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
     df = df.set_index("timestamp").sort_index()
     df_8h = df["fundingRate"].resample("8h").mean().dropna().reset_index()
@@ -404,8 +404,8 @@ def _normalize_bitfinex(rows: list[dict], symbol: str, days: int) -> pd.DataFram
 _KUCOIN_BASE = "https://api-futures.kucoin.com"
 
 
-def _fetch_kucoin(symbol: str, days: int) -> list[dict]:
-    start_ms = int(_cutoff(days).timestamp() * 1000)
+def _fetch_kucoin(symbol: str, start_dt: datetime) -> list[dict]:
+    start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(_utc_now().timestamp() * 1000)
     out: list[dict] = []
     cur_from = start_ms
@@ -489,39 +489,73 @@ def _write_df(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
 # Download command
 # ---------------------------------------------------------------------------
 
-def _fetch_all(days: int) -> list[pd.DataFrame]:
-    jobs: list[tuple[str, str, Any]] = []
+def _resolve_start(conn: sqlite3.Connection, exchange: str, symbol: str, cutoff_dt: datetime) -> datetime:
+    """Earliest timestamp still missing for one (exchange, symbol).
+
+    Incremental fetch: if the database already reaches back to the window start,
+    only fetch the tail after the most recent stored row. Otherwise (empty DB, or
+    a gap before the window start) fetch the whole window from the cutoff.
+    """
+    row = conn.execute(
+        f"SELECT MIN(timestamp), MAX(timestamp) FROM {TABLE} WHERE exchange=? AND symbol=?",
+        (exchange, symbol),
+    ).fetchone()
+    min_ts, max_ts = row if row else (None, None)
+    if min_ts and max_ts:
+        min_dt = pd.to_datetime(min_ts, utc=True).to_pydatetime()
+        max_dt = pd.to_datetime(max_ts, utc=True).to_pydatetime()
+        if min_dt <= cutoff_dt:  # DB already spans back to the window start
+            return max(cutoff_dt, max_dt + timedelta(seconds=1))
+    return cutoff_dt
+
+
+def _fetch_all(conn: sqlite3.Connection, cutoff_dt: datetime) -> list[pd.DataFrame]:
+    # (display tag, DB exchange key, symbol, fetch+normalize fn taking the start datetime)
+    jobs: list[tuple[str, str, str, Any]] = []
 
     for sym in KRAKEN_SYMBOLS:
-        jobs.append(("KRAKEN", sym, lambda s=sym: _normalize_kraken(_fetch_kraken(s), s, days)))
+        jobs.append(("KRAKEN", "KRAKEN", sym,
+                     lambda start, s=sym: _normalize_kraken(_fetch_kraken(s), s, start)))
     for sym in BINANCE_USDM_SYMBOLS:
-        jobs.append(("BINANCE USDM", sym, lambda s=sym: _normalize_generic(_fetch_binance(s, "BINANCE", days), s, "BINANCE", days)))
+        jobs.append(("BINANCE USDM", "BINANCE", sym,
+                     lambda start, s=sym: _normalize_generic(_fetch_binance(s, "BINANCE", start), s, "BINANCE", start)))
     for sym in BINANCE_COINM_SYMBOLS:
-        jobs.append(("BINANCE COINM", sym, lambda s=sym: _normalize_generic(_fetch_binance(s, "BINANCE_COINM", days), s, "BINANCE_COINM", days)))
+        jobs.append(("BINANCE COINM", "BINANCE_COINM", sym,
+                     lambda start, s=sym: _normalize_generic(_fetch_binance(s, "BINANCE_COINM", start), s, "BINANCE_COINM", start)))
     for sym in DERIBIT_SYMBOLS:
-        jobs.append(("DERIBIT", sym, lambda s=sym: _normalize_deribit(_fetch_deribit(s, days), s, days)))
+        jobs.append(("DERIBIT", "DERIBIT", sym,
+                     lambda start, s=sym: _normalize_deribit(_fetch_deribit(s, start), s, start)))
     for sym in BYBIT_SYMBOLS:
-        jobs.append(("BYBIT", sym, lambda s=sym: _normalize_generic(_fetch_bybit(s, days), s, "BYBIT", days)))
+        jobs.append(("BYBIT", "BYBIT", sym,
+                     lambda start, s=sym: _normalize_generic(_fetch_bybit(s, start), s, "BYBIT", start)))
     for sym in OKX_SYMBOLS:
-        jobs.append(("OKX", sym, lambda s=sym: _normalize_generic(_fetch_okx(s, days), s, "OKX", days)))
+        jobs.append(("OKX", "OKX", sym,
+                     lambda start, s=sym: _normalize_generic(_fetch_okx(s, start), s, "OKX", start)))
     for sym in BITFINEX_SYMBOLS:
-        jobs.append(("BITFINEX", sym, lambda s=sym: _normalize_bitfinex(_fetch_bitfinex(s, days), s, days)))
+        jobs.append(("BITFINEX", "BITFINEX", sym,
+                     lambda start, s=sym: _normalize_bitfinex(_fetch_bitfinex(s, start), s, start)))
     for sym in KUCOIN_SYMBOLS:
-        jobs.append(("KUCOIN", sym, lambda s=sym: _normalize_generic(_fetch_kucoin(s, days), s, "KUCOIN", days)))
+        jobs.append(("KUCOIN", "KUCOIN", sym,
+                     lambda start, s=sym: _normalize_generic(_fetch_kucoin(s, start), s, "KUCOIN", start)))
 
-    def _run_job(tag: str, sym: str, fetch_fn: Any) -> pd.DataFrame | None:
-        _log(tag, f"Fetching {sym} ...")
+    # Decide each symbol's start up front, in this thread — the SQLite connection
+    # is not shared with the worker threads below.
+    starts = {(dbx, sym): _resolve_start(conn, dbx, sym, cutoff_dt) for _tag, dbx, sym, _fn in jobs}
+
+    def _run_job(tag: str, sym: str, fetch_fn: Any, start: datetime) -> pd.DataFrame | None:
+        _log(tag, f"Fetching {sym} since {start:%Y-%m-%d %H:%M} UTC ...")
         try:
-            df = fetch_fn()
-            _log(tag, f"{sym}: {len(df)} records after filtering to last {days} days.")
+            df = fetch_fn(start)
+            _log(tag, f"{sym}: {len(df)} new records.")
             return df if not df.empty else None
         except Exception as e:
             _log(tag, f"{sym}: {e}", error=True)
             return None
 
     frames: list[pd.DataFrame] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_run_job, tag, sym, fn): (tag, sym) for tag, sym, fn in jobs}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = {pool.submit(_run_job, tag, sym, fn, starts[(dbx, sym)]): (tag, sym)
+                   for tag, dbx, sym, fn in jobs}
         for fut in as_completed(futures):
             result = fut.result()
             if result is not None:
@@ -532,15 +566,18 @@ def _fetch_all(days: int) -> list[pd.DataFrame]:
 
 def cmd_download(args: argparse.Namespace) -> None:
     t0 = time.monotonic()
-    frames = _fetch_all(args.days)
-    if not frames:
-        _log("DOWNLOAD", "No data collected from any exchange.", error=True)
-        sys.exit(1)
+    # Align the fetch cutoff with the simulation window start (midnight UTC, `days`
+    # ago) so a fresh download covers exactly what the simulation later queries.
+    cutoff_dt = _cutoff(args.days).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    df_all = pd.concat(frames, ignore_index=True).sort_values(["exchange", "symbol", "timestamp"]).reset_index(drop=True)
     conn = sqlite3.connect(args.db)
     try:
         _ensure_schema(conn)
+        frames = _fetch_all(conn, cutoff_dt)
+        if not frames:
+            _log("DOWNLOAD", f"No new rows; database already up to date ({time.monotonic() - t0:.1f}s).")
+            return
+        df_all = pd.concat(frames, ignore_index=True).sort_values(["exchange", "symbol", "timestamp"]).reset_index(drop=True)
         _write_df(conn, df_all)
     finally:
         conn.close()
@@ -568,21 +605,24 @@ def _query_rates(conn: sqlite3.Connection, exchange: str, symbol: str, start_z: 
 
 def _expand_8h_to_hourly(df_8h: pd.DataFrame, rate_col: str) -> pd.DataFrame:
     """Convert 8-hour funding rates to hourly via r_hour = (1 + r_8h)^(1/8) - 1, vectorized."""
-    df = df_8h.dropna(subset=[rate_col]).copy()
+    df = df_8h.dropna(subset=[rate_col])
     if df.empty:
         return pd.DataFrame(columns=["timestamp", "rate_hourly"])
-    one_plus = 1.0 + df[rate_col]
-    df = df[one_plus > 0].reset_index(drop=True)
-    if df.empty:
-        return pd.DataFrame(columns=["timestamp", "rate_hourly"])
-    r_hour = one_plus[df.index].pow(1.0 / 8.0) - 1.0
 
-    # Vectorized expansion: repeat each row 8 times with hour offsets
-    ts = df["timestamp"].values
-    rates = r_hour.values
+    # Work in numpy so the same mask applies to timestamps and rates. (Filtering a
+    # DataFrame and then indexing a stale Series by the reset index silently
+    # misaligns the two — and raises KeyError once any row has been dropped.)
+    one_plus = 1.0 + df[rate_col].to_numpy(dtype="float64")
+    keep = one_plus > 0.0  # (1 + r) <= 0 would make the fractional power undefined
+    if not keep.any():
+        return pd.DataFrame(columns=["timestamp", "rate_hourly"])
+    ts = df["timestamp"].to_numpy(dtype="datetime64[ns]")[keep]
+    r_hour = one_plus[keep] ** (1.0 / 8.0) - 1.0
+
+    # Vectorized expansion: repeat each 8h rate across the 8 hourly buckets it covers
     offsets = np.arange(7, -1, -1)  # 7,6,5,...,0
     expanded_ts = np.repeat(ts, 8) - np.tile(offsets, len(ts)) * np.timedelta64(1, "h")
-    expanded_rates = np.repeat(rates, 8)
+    expanded_rates = np.repeat(r_hour, 8)
 
     out = pd.DataFrame({"timestamp": expanded_ts, "rate_hourly": expanded_rates})
     out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
