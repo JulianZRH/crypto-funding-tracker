@@ -74,6 +74,12 @@ SIMULATE_PAIRS_BY_ASSET: dict[str, dict[tuple[str, str], str]] = {
     },
 }
 
+# Pairs shown as a daily annualized-yield (APY) table, in addition to the charts.
+APY_TABLE_PAIRS: list[tuple[str, str]] = [
+    ("KRAKEN", "PF_XBTUSD"),
+    ("KRAKEN", "PF_ETHUSD"),
+]
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -649,7 +655,7 @@ def _simulate_compounding(rates: pd.DataFrame, initial: float) -> pd.DataFrame:
     return out
 
 
-def _simulate_asset(asset: str, conn: sqlite3.Connection, args: argparse.Namespace,
+def _simulate_asset(asset: str, conn: sqlite3.Connection, args: argparse.Namespace, days: int,
                     start_z: str, end_z: str, start_date: str, end_date: str) -> tuple[dict[str, pd.DataFrame], dict[str, float]]:
     """Run simulation for a single asset, return (histories, finals)."""
     simulate_pairs = SIMULATE_PAIRS_BY_ASSET.get(asset)
@@ -677,10 +683,10 @@ def _simulate_asset(asset: str, conn: sqlite3.Connection, args: argparse.Namespa
 
     if finals:
         _log("SIMULATE", f"  [{asset}] Investment per leg: {args.investment:,.2f}")
-        _log("SIMULATE", f"  [{asset}] Period: {start_date} to {end_date} ({args.days} days)")
+        _log("SIMULATE", f"  [{asset}] Period: {start_date} to {end_date} ({days} days)")
         for label, fv in finals.items():
             ret_pct = (fv / args.investment - 1) * 100
-            pa_yield = ((fv / args.investment) ** (365.0 / args.days) - 1) * 100
+            pa_yield = ((fv / args.investment) ** (365.0 / days) - 1) * 100
             _log("SIMULATE", f"    {label}: {fv:,.2f}  ({ret_pct:+.2f}% / {pa_yield:+.2f}% p.a.)")
 
     return histories, finals
@@ -706,25 +712,140 @@ def _plot_asset(asset: str, histories: dict[str, pd.DataFrame], finals: dict[str
     plt.tight_layout()
 
 
+def _pair_label(exchange: str, symbol: str) -> str:
+    """Human-readable label for an (exchange, symbol) pair, falling back to the raw ids."""
+    for pairs in SIMULATE_PAIRS_BY_ASSET.values():
+        label = pairs.get((exchange, symbol))
+        if label:
+            return label
+    return f"{exchange} {symbol}"
+
+
+def _daily_apy(hourly: pd.DataFrame) -> pd.DataFrame:
+    """Per-UTC-day funding return and its annualized (compounded) yield.
+
+    Columns: date, hours, daily_return, apy — all as fractions, not percent.
+    """
+    df = hourly.copy()
+    df["date"] = df["timestamp"].dt.tz_convert("UTC").dt.date
+    grouped = df.groupby("date")["rate_hourly"]
+    out = pd.DataFrame({
+        "hours": grouped.size(),
+        "daily_return": grouped.apply(lambda s: float(np.prod(1.0 + s.to_numpy(dtype="float64")) - 1.0)),
+    }).reset_index()
+    growth = 1.0 + out["daily_return"].to_numpy(dtype="float64")
+    # A day that lost more than 100% cannot be annualized; keep the row, blank the APY.
+    out["apy"] = np.where(growth > 0.0, growth ** 365.0 - 1.0, np.nan)
+    return out
+
+
+def _apy_table(conn: sqlite3.Connection, exchange: str, symbol: str, days: int,
+               start_z: str, end_z: str) -> pd.DataFrame:
+    """Build the daily APY table for one pair over the window, newest day first."""
+    raw = _query_rates(conn, exchange, symbol, start_z, end_z)
+    if raw.empty:
+        return pd.DataFrame()
+    hourly = _to_hourly(exchange, raw)
+    mask = (hourly["timestamp"] >= pd.to_datetime(start_z)) & (hourly["timestamp"] < pd.to_datetime(end_z))
+    hourly = hourly.loc[mask].drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+    if hourly.empty:
+        return pd.DataFrame()
+    return _daily_apy(hourly).sort_values("date", ascending=False).reset_index(drop=True)
+
+
+def _print_apy_table(label: str, table: pd.DataFrame, days: int, start_date: str, end_date: str) -> None:
+    """Print the daily APY table to stdout (plain print: _log's prefix would break alignment)."""
+    _log("SIMULATE", f"  Annualized yield per day - {label} - {days} days ({start_date} to {end_date})")
+    header = f"    {'Date (UTC)':<12} {'Hours':>5} {'Daily %':>10} {'APY %':>10}"
+    print()
+    print(header)
+    print("    " + "-" * (len(header) - 4))
+    for row in table.itertuples(index=False):
+        apy = "     n/a" if pd.isna(row.apy) else f"{row.apy * 100:+10.2f}"
+        print(f"    {row.date.isoformat():<12} {row.hours:>5d} {row.daily_return * 100:+10.4f} {apy:>10}")
+
+    growth = float(np.prod(1.0 + table["daily_return"].to_numpy(dtype="float64")))
+    period_pct = (growth - 1.0) * 100
+    covered = len(table)
+    print("    " + "-" * (len(header) - 4))
+    if growth > 0.0 and covered > 0:
+        annualized = (growth ** (365.0 / covered) - 1.0) * 100
+        print(f"    {'Period':<12} {int(table['hours'].sum()):>5d} {period_pct:+10.4f} {annualized:+10.2f}")
+    else:
+        print(f"    {'Period':<12} {int(table['hours'].sum()):>5d} {period_pct:+10.4f} {'n/a':>10}")
+    print(f"    ({covered} day(s) with data; period APY compounds the observed days to 365.)")
+    print()
+
+
+def _plot_apy_table(label: str, table: pd.DataFrame, days: int, start_date: str,
+                    end_date: str, fig_num: int) -> None:
+    """Render the daily APY table as its own figure so it shows next to the charts."""
+    import matplotlib.pyplot as plt
+
+    cells = []
+    for row in table.itertuples(index=False):
+        apy = "n/a" if pd.isna(row.apy) else f"{row.apy * 100:+.2f}"
+        cells.append([row.date.isoformat(), str(row.hours), f"{row.daily_return * 100:+.4f}", apy])
+
+    fig = plt.figure(fig_num, figsize=(7, min(0.26 * (len(cells) + 1) + 1.0, 11)))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+    # bbox fills the axes, so the row count drives the figure height instead of
+    # leaving the table squeezed into the top of an oversized canvas.
+    tbl = ax.table(cellText=cells,
+                   colLabels=["Date (UTC)", "Hours", "Daily %", "APY %"],
+                   cellLoc="right", bbox=[0.0, 0.0, 1.0, 1.0])
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    ax.set_title(f"{label} — annualized yield per day" + chr(10) + f"{days} days ({start_date} to {end_date})")
+    fig.tight_layout()
+
+
 def cmd_simulate(args: argparse.Namespace) -> None:
     import matplotlib.pyplot as plt
 
-    start_date = (datetime.now(timezone.utc).date() - timedelta(days=args.days)).isoformat()
-    end_date = datetime.now(timezone.utc).date().isoformat()
-    start_z = pd.to_datetime(start_date, utc=True).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    end_z = (pd.to_datetime(end_date, utc=True).normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    import config
+
+    windows = list(getattr(config, "CHART_DAYS", None) or [args.days])
 
     asset = args.asset.upper()
     assets = ["BTC", "ETH"] if asset == "BOTH" else [asset]
 
     conn = sqlite3.connect(args.db)
     any_data = False
+    fig_num = 0
 
-    for i, a in enumerate(assets):
-        histories, finals = _simulate_asset(a, conn, args, start_z, end_z, start_date, end_date)
-        if finals:
+    for days in windows:
+        start_date = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+        end_date = datetime.now(timezone.utc).date().isoformat()
+        start_z = pd.to_datetime(start_date, utc=True).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        end_z = (pd.to_datetime(end_date, utc=True).normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        for a in assets:
+            fig_num += 1
+            histories, finals = _simulate_asset(a, conn, args, days, start_z, end_z, start_date, end_date)
+            if finals:
+                any_data = True
+                _plot_asset(a, histories, finals, args.investment, days, start_date, end_date, fig_num=fig_num)
+
+    # Daily annualized-yield table(s) — independent of the chart windows above.
+    table_days = int(getattr(config, "APY_TABLE_DAYS", 30))
+    if getattr(config, "SHOW_APY_TABLE", True) and table_days > 0:
+        start_date = (datetime.now(timezone.utc).date() - timedelta(days=table_days)).isoformat()
+        end_date = datetime.now(timezone.utc).date().isoformat()
+        start_z = pd.to_datetime(start_date, utc=True).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        end_z = (pd.to_datetime(end_date, utc=True).normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        for exchange, symbol in APY_TABLE_PAIRS:
+            label = _pair_label(exchange, symbol)
+            table = _apy_table(conn, exchange, symbol, table_days, start_z, end_z)
+            if table.empty:
+                _log("SIMULATE", f"Skip APY table — no data for {label} in range.")
+                continue
             any_data = True
-            _plot_asset(a, histories, finals, args.investment, args.days, start_date, end_date, fig_num=i + 1)
+            _print_apy_table(label, table, table_days, start_date, end_date)
+            fig_num += 1
+            _plot_apy_table(label, table, table_days, start_date, end_date, fig_num=fig_num)
 
     conn.close()
 
